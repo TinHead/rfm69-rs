@@ -223,7 +223,7 @@ where
         Ok(())
     }
 
-    fn set_frequency(&mut self, freq_mhz: u32) -> Result<(), Rfm69Error> {
+    pub fn set_frequency(&mut self, freq_mhz: u32) -> Result<(), Rfm69Error> {
         let mut frf = (freq_mhz * RF69_FSTEP) as u32;
         frf /= RF69_FXOSC as u32;
 
