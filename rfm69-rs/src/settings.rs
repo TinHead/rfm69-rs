@@ -1,22 +1,47 @@
+//! RFM69 configuration settings and constants.
+//!
+//! This module provides configuration types for the RFM69 radio module,
+//! including modem presets and sync word configuration.
+
 #![allow(dead_code)]
 
-// The crystal oscillator frequency of the RF69 module
+/// The crystal oscillator frequency of the RF69 module in MHz.
 pub const RF69_FXOSC: f32 = 32000000.0 / 1000000.0;
 
-// The Frequency Synthesizer step = RF69_FXOSC / 2^^19
+/// The Frequency Synthesizer step = RF69_FXOSC / 2^^19
 pub const RF69_FSTEP: u32 = 524288;
 
+/// DAGC (Digital Automatic Gain Control) configuration.
 pub enum ContinuousDagc {
     NormalMode = 0x00,
     ImprovedLowBeta0 = 0x20,
     ImprovedLowBeta1 = 0x30,
 }
 
-
+/// Sync word configuration for packet detection.
+///
+/// The sync word is used to identify valid packets. When a matching
+/// sync word is detected, the receiver knows a packet is starting.
+#[derive(Clone, Copy)]
 pub enum SyncConfiguration {
+    /// Sync word detection disabled.
     SyncOff,
-    FifoFillAuto { sync_tolerance: u8 },
-    FifoFillManual { sync_tolerance: u8 },
+    /// Automatic FIFO fill after sync word detection.
+    ///
+    /// `sync_tolerance` specifies the number of bit errors allowed
+    /// in the sync word (0-7).
+    FifoFillAuto {
+        /// Number of tolerated bit errors in sync word (0-7).
+        sync_tolerance: u8,
+    },
+    /// Manual FIFO fill control after sync word detection.
+    ///
+    /// `sync_tolerance` specifies the number of bit errors allowed
+    /// in the sync word (0-7).
+    FifoFillManual {
+        /// Number of tolerated bit errors in sync word (0-7).
+        sync_tolerance: u8,
+    },
 }
 
 impl SyncConfiguration {
@@ -63,8 +88,6 @@ mod test {
         });
     }
 }
-
-
 
 pub struct ModemConfig {
     reg_02: u8,
@@ -120,40 +143,85 @@ const CONFIG_MANCHESTER: u8 = RH_RF69_PACKETCONFIG1_PACKETFORMAT_VARIABLE
     | RH_RF69_PACKETCONFIG1_CRC_ON
     | RH_RF69_PACKETCONFIG1_ADDRESSFILTERING_NONE;
 
-
+/// Predefined modem configuration presets.
+///
+/// Each preset configures the modulation type, bitrate, and frequency deviation
+/// (or bandwidth for OOK). All presets use whitening for improved performance.
+///
+/// # Naming Convention
+///
+/// - `Fsk` / `Gfsk` / `Ook` - Modulation type
+/// - `Rb` - Bitrate in kbps
+/// - `Fd` - Frequency deviation in kHz (FSK/GFSK)
+/// - `Bw` - Receiver bandwidth in kHz (OOK)
+///
+/// # Example
+///
+/// ```ignore
+/// use rfm69_rs::settings::ModemConfigChoice;
+///
+/// // Use GFSK at 250kbps with 250kHz deviation
+/// rfm69.set_modem_config(ModemConfigChoice::GfskRb250Fd250).await?;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModemConfigChoice {
-    FskRb2Fd5,       // FSK, Whitening, Rb = 2kbs,    Fd = 5kHz
-    FskRb2_4Fd4_8,   // FSK, Whitening, Rb = 2.4kbs,  Fd = 4.8kHz
-    FskRb4_8Fd9_6,   // FSK, Whitening, Rb = 4.8kbs,  Fd = 9.6kHz
-    FskRb9_6Fd19_2,  // FSK, Whitening, Rb = 9.6kbs,  Fd = 19.2kHz
-    FskRb19_2Fd38_4, // FSK, Whitening, Rb = 19.2kbs, Fd = 38.4kHz
-    FskRb38_4Fd76_8, // FSK, Whitening, Rb = 38.4kbs, Fd = 76.8kHz
-    FskRb57_6Fd120,  // FSK, Whitening, Rb = 57.6kbs, Fd = 120kHz
-    FskRb125Fd125,   // FSK, Whitening, Rb = 125kbs,  Fd = 125kHz
-    FskRb250Fd250,   // FSK, Whitening, Rb = 250kbs,  Fd = 250kHz
-    FskRb55555Fd50,  // FSK, Whitening, Rb = 55555kbs, Fd = 50kHz
+    /// FSK, Whitening, Rb = 2kbs, Fd = 5kHz
+    FskRb2Fd5,
+    /// FSK, Whitening, Rb = 2.4kbs, Fd = 4.8kHz
+    FskRb2_4Fd4_8,
+    /// FSK, Whitening, Rb = 4.8kbs, Fd = 9.6kHz
+    FskRb4_8Fd9_6,
+    /// FSK, Whitening, Rb = 9.6kbs, Fd = 19.2kHz
+    FskRb9_6Fd19_2,
+    /// FSK, Whitening, Rb = 19.2kbs, Fd = 38.4kHz
+    FskRb19_2Fd38_4,
+    /// FSK, Whitening, Rb = 38.4kbs, Fd = 76.8kHz
+    FskRb38_4Fd76_8,
+    /// FSK, Whitening, Rb = 57.6kbs, Fd = 120kHz
+    FskRb57_6Fd120,
+    /// FSK, Whitening, Rb = 125kbs, Fd = 125kHz
+    FskRb125Fd125,
+    /// FSK, Whitening, Rb = 250kbs, Fd = 250kHz
+    FskRb250Fd250,
+    /// FSK, Whitening, Rb = 55.555kbs, Fd = 50kHz
+    FskRb55555Fd50,
 
-    GfskRb2Fd5,       // GFSK, Whitening, Rb = 2kbs,    Fd = 5kHz
-    GfskRb2_4Fd4_8,   // GFSK, Whitening, Rb = 2.4kbs,  Fd = 4.8kHz
-    GfskRb4_8Fd9_6,   // GFSK, Whitening, Rb = 4.8kbs,  Fd = 9.6kHz
-    GfskRb9_6Fd19_2,  // GFSK, Whitening, Rb = 9.6kbs,  Fd = 19.2kHz
-    GfskRb19_2Fd38_4, // GFSK, Whitening, Rb = 19.2kbs, Fd = 38.4kHz
-    GfskRb38_4Fd76_8, // GFSK, Whitening, Rb = 38.4kbs, Fd = 76.8kHz
-    GfskRb57_6Fd120,  // GFSK, Whitening, Rb = 57.6kbs, Fd = 120kHz
-    GfskRb125Fd125,   // GFSK, Whitening, Rb = 125kbs,  Fd = 125kHz
-    GfskRb250Fd250,   // GFSK, Whitening, Rb = 250kbs,  Fd = 250kHz
-    GfskRb55555Fd50,  // GFSK, Whitening, Rb = 55555kbs, Fd = 50kHz
+    /// GFSK, Whitening, Rb = 2kbs, Fd = 5kHz
+    GfskRb2Fd5,
+    /// GFSK, Whitening, Rb = 2.4kbs, Fd = 4.8kHz
+    GfskRb2_4Fd4_8,
+    /// GFSK, Whitening, Rb = 4.8kbs, Fd = 9.6kHz
+    GfskRb4_8Fd9_6,
+    /// GFSK, Whitening, Rb = 9.6kbs, Fd = 19.2kHz
+    GfskRb9_6Fd19_2,
+    /// GFSK, Whitening, Rb = 19.2kbs, Fd = 38.4kHz
+    GfskRb19_2Fd38_4,
+    /// GFSK, Whitening, Rb = 38.4kbs, Fd = 76.8kHz
+    GfskRb38_4Fd76_8,
+    /// GFSK, Whitening, Rb = 57.6kbs, Fd = 120kHz
+    GfskRb57_6Fd120,
+    /// GFSK, Whitening, Rb = 125kbs, Fd = 125kHz
+    GfskRb125Fd125,
+    /// GFSK, Whitening, Rb = 250kbs, Fd = 250kHz
+    GfskRb250Fd250,
+    /// GFSK, Whitening, Rb = 55.555kbs, Fd = 50kHz
+    GfskRb55555Fd50,
 
-    OokRb1Bw1,       // OOK, Whitening, Rb = 1kbs,    Rx Bandwidth = 1kHz
-    OokRb1_2Bw75,    // OOK, Whitening, Rb = 1.2kbs,  Rx Bandwidth = 75kHz
-    OokRb2_4Bw4_8,   // OOK, Whitening, Rb = 2.4kbs,  Rx Bandwidth = 4.8kHz
-    OokRb4_8Bw9_6,   // OOK, Whitening, Rb = 4.8kbs,  Rx Bandwidth = 9.6kHz
-    OokRb9_6Bw19_2,  // OOK, Whitening, Rb = 9.6kbs,  Rx Bandwidth = 19.2kHz
-    OokRb19_2Bw38_4, // OOK, Whitening, Rb = 19.2kbs, Rx Bandwidth = 38.4kHz
-    OokRb32Bw64,     // OOK, Whitening, Rb = 32kbs,   Rx Bandwidth = 64kHz
+    /// OOK, Whitening, Rb = 1kbs, Rx Bandwidth = 1kHz
+    OokRb1Bw1,
+    /// OOK, Whitening, Rb = 1.2kbs, Rx Bandwidth = 75kHz
+    OokRb1_2Bw75,
+    /// OOK, Whitening, Rb = 2.4kbs, Rx Bandwidth = 4.8kHz
+    OokRb2_4Bw4_8,
+    /// OOK, Whitening, Rb = 4.8kbs, Rx Bandwidth = 9.6kHz
+    OokRb4_8Bw9_6,
+    /// OOK, Whitening, Rb = 9.6kbs, Rx Bandwidth = 19.2kHz
+    OokRb9_6Bw19_2,
+    /// OOK, Whitening, Rb = 19.2kbs, Rx Bandwidth = 38.4kHz
+    OokRb19_2Bw38_4,
+    /// OOK, Whitening, Rb = 32kbs, Rx Bandwidth = 64kHz
+    OokRb32Bw64,
 }
-
 
 impl ModemConfigChoice {
     const FSK_RB2_FD5: [u8; 8] = [CONFIG_FSK, 0x3e, 0x80, 0x00, 0x52, 0xf4, 0xf4, CONFIG_WHITE];
@@ -161,26 +229,118 @@ impl ModemConfigChoice {
     const FSK_RB4_8FD9_6: [u8; 8] = [CONFIG_FSK, 0x1a, 0x0b, 0x00, 0x9d, 0xf4, 0xf4, CONFIG_WHITE];
 
     const FSK_RB9_6FD19_2: [u8; 8] = [CONFIG_FSK, 0x0d, 0x05, 0x01, 0x3b, 0xf4, 0xf4, CONFIG_WHITE];
-    const FSK_RB19_2FD38_4: [u8; 8] = [CONFIG_FSK, 0x06, 0x83, 0x02, 0x75, 0xf3, 0xf3, CONFIG_WHITE];
-    const FSK_RB38_4FD76_8: [u8; 8] = [CONFIG_FSK, 0x03, 0x41, 0x04, 0xea, 0xf2, 0xf2, CONFIG_WHITE];
+    const FSK_RB19_2FD38_4: [u8; 8] =
+        [CONFIG_FSK, 0x06, 0x83, 0x02, 0x75, 0xf3, 0xf3, CONFIG_WHITE];
+    const FSK_RB38_4FD76_8: [u8; 8] =
+        [CONFIG_FSK, 0x03, 0x41, 0x04, 0xea, 0xf2, 0xf2, CONFIG_WHITE];
 
     const FSK_RB57_6FD120: [u8; 8] = [CONFIG_FSK, 0x02, 0x2c, 0x07, 0xae, 0xe2, 0xe2, CONFIG_WHITE];
     const FSK_RB125FD125: [u8; 8] = [CONFIG_FSK, 0x01, 0x00, 0x08, 0x00, 0xe1, 0xe1, CONFIG_WHITE];
     const FSK_RB250FD250: [u8; 8] = [CONFIG_FSK, 0x00, 0x80, 0x10, 0x00, 0xe0, 0xe0, CONFIG_WHITE];
     const FSK_RB55555FD50: [u8; 8] = [CONFIG_FSK, 0x02, 0x40, 0x03, 0x33, 0x42, 0x42, CONFIG_WHITE];
 
-    const GFSK_RB2_FD5: [u8; 8] = [CONFIG_GFSK, 0x3e, 0x80, 0x00, 0x52, 0xf4, 0xf5, CONFIG_WHITE];
-    const GFSK_RB2_4FD4_8: [u8; 8] = [CONFIG_GFSK, 0x34, 0x15, 0x00, 0x4f, 0xf4, 0xf4, CONFIG_WHITE];
-    const GFSK_RB4_8FD9_6: [u8; 8] = [CONFIG_GFSK, 0x1a, 0x0b, 0x00, 0x9d, 0xf4, 0xf4, CONFIG_WHITE];
+    const GFSK_RB2_FD5: [u8; 8] = [
+        CONFIG_GFSK,
+        0x3e,
+        0x80,
+        0x00,
+        0x52,
+        0xf4,
+        0xf5,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB2_4FD4_8: [u8; 8] = [
+        CONFIG_GFSK,
+        0x34,
+        0x15,
+        0x00,
+        0x4f,
+        0xf4,
+        0xf4,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB4_8FD9_6: [u8; 8] = [
+        CONFIG_GFSK,
+        0x1a,
+        0x0b,
+        0x00,
+        0x9d,
+        0xf4,
+        0xf4,
+        CONFIG_WHITE,
+    ];
 
-    const GFSK_RB9_6FD19_2: [u8; 8] = [CONFIG_GFSK, 0x0d, 0x05, 0x01, 0x3b, 0xf4, 0xf4, CONFIG_WHITE];
-    const GFSK_RB19_2FD38_4: [u8; 8] = [CONFIG_GFSK, 0x06, 0x83, 0x02, 0x75, 0xf3, 0xf3, CONFIG_WHITE];
-    const GFSK_RB38_4FD76_8: [u8; 8] = [CONFIG_GFSK, 0x03, 0x41, 0x04, 0xea, 0xf2, 0xf2, CONFIG_WHITE];
+    const GFSK_RB9_6FD19_2: [u8; 8] = [
+        CONFIG_GFSK,
+        0x0d,
+        0x05,
+        0x01,
+        0x3b,
+        0xf4,
+        0xf4,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB19_2FD38_4: [u8; 8] = [
+        CONFIG_GFSK,
+        0x06,
+        0x83,
+        0x02,
+        0x75,
+        0xf3,
+        0xf3,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB38_4FD76_8: [u8; 8] = [
+        CONFIG_GFSK,
+        0x03,
+        0x41,
+        0x04,
+        0xea,
+        0xf2,
+        0xf2,
+        CONFIG_WHITE,
+    ];
 
-    const GFSK_RB57_6FD120: [u8; 8] = [CONFIG_GFSK, 0x02, 0x2c, 0x07, 0xae, 0xe2, 0xe2, CONFIG_WHITE];
-    const GFSK_RB125FD125: [u8; 8] = [CONFIG_GFSK, 0x01, 0x00, 0x08, 0x00, 0xe1, 0xe1, CONFIG_WHITE];
-    const GFSK_RB250FD250: [u8; 8] = [CONFIG_GFSK, 0x00, 0x80, 0x10, 0x00, 0xe0, 0xe0, CONFIG_WHITE];
-    const GFSK_RB55555FD50: [u8; 8] = [CONFIG_GFSK, 0x02, 0x40, 0x03, 0x33, 0x42, 0x42, CONFIG_WHITE];
+    const GFSK_RB57_6FD120: [u8; 8] = [
+        CONFIG_GFSK,
+        0x02,
+        0x2c,
+        0x07,
+        0xae,
+        0xe2,
+        0xe2,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB125FD125: [u8; 8] = [
+        CONFIG_GFSK,
+        0x01,
+        0x00,
+        0x08,
+        0x00,
+        0xe1,
+        0xe1,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB250FD250: [u8; 8] = [
+        CONFIG_GFSK,
+        0x00,
+        0x80,
+        0x10,
+        0x00,
+        0xe0,
+        0xe0,
+        CONFIG_WHITE,
+    ];
+    const GFSK_RB55555FD50: [u8; 8] = [
+        CONFIG_GFSK,
+        0x02,
+        0x40,
+        0x03,
+        0x33,
+        0x42,
+        0x42,
+        CONFIG_WHITE,
+    ];
 
     const OOK_RB1_BW1: [u8; 8] = [CONFIG_OOK, 0x7d, 0x00, 0x00, 0x10, 0x88, 0x88, CONFIG_WHITE];
     const OOK_RB1_2BW75: [u8; 8] = [CONFIG_OOK, 0x68, 0x2b, 0x00, 0x10, 0xf1, 0xf1, CONFIG_WHITE];
@@ -188,7 +348,8 @@ impl ModemConfigChoice {
 
     const OOK_RB4_8BW9_6: [u8; 8] = [CONFIG_OOK, 0x1a, 0x0b, 0x00, 0x10, 0xf4, 0xf4, CONFIG_WHITE];
     const OOK_RB9_6BW19_2: [u8; 8] = [CONFIG_OOK, 0x0d, 0x05, 0x00, 0x10, 0xf3, 0xf3, CONFIG_WHITE];
-    const OOK_RB19_2BW38_4: [u8; 8] = [CONFIG_OOK, 0x06, 0x83, 0x00, 0x10, 0xf2, 0xf2, CONFIG_WHITE];
+    const OOK_RB19_2BW38_4: [u8; 8] =
+        [CONFIG_OOK, 0x06, 0x83, 0x00, 0x10, 0xf2, 0xf2, CONFIG_WHITE];
     const OOK_RB32BW64: [u8; 8] = [CONFIG_OOK, 0x03, 0xe8, 0x00, 0x10, 0xe2, 0xe2, CONFIG_WHITE];
 
     pub fn values(&self) -> &[u8; 8] {
@@ -222,9 +383,8 @@ impl ModemConfigChoice {
             Self::OokRb9_6Bw19_2 => &Self::OOK_RB9_6BW19_2,
             Self::OokRb19_2Bw38_4 => &Self::OOK_RB19_2BW38_4,
             Self::OokRb32Bw64 => &Self::OOK_RB32BW64,
+        }
     }
-}
-
 }
 
 pub const RF_PALEVEL_PA0_ON: u8 = 0x80;

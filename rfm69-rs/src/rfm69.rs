@@ -1,51 +1,116 @@
+//! RFM69 Radio Driver
+//!
+//! An async driver for the RFM69 series of radio modules using `embedded-hal-async` traits.
+//!
+//! # Example
+//!
+//! ```ignore
+//! let mut rfm69 = Rfm69::new(spi_device, reset_pin, dio0_pin, delay);
+//! rfm69.init().await?;
+//! rfm69.set_frequency(915).await?;
+//!
+//! // Send a message
+//! rfm69.send(b"Hello, World!").await?;
+//!
+//! // Receive a message
+//! rfm69.set_mode(Rfm69Mode::Rx).await?;
+//! rfm69.wait_for_message().await?;
+//! let mut buffer = [0u8; 65];
+//! let len = rfm69.receive(&mut buffer).await?;
+//! ```
+
 use crate::read_write::ReadWrite;
 use crate::registers::Register;
 use crate::settings::{
     ContinuousDagc, ModemConfigChoice, SyncConfiguration, RF69_FSTEP, RF69_FXOSC,
-    RF_DIOMAPPING1_DIO0_00, RF_DIOMAPPING1_DIO0_01, RF_PALEVEL_OUTPUTPOWER_11111,
-    RF_PALEVEL_PA0_ON, RF_PALEVEL_PA1_ON, RF_PALEVEL_PA2_ON,
+    RF_DIOMAPPING1_DIO0_00, RF_PALEVEL_OUTPUTPOWER_11111, RF_PALEVEL_PA0_ON, RF_PALEVEL_PA1_ON,
+    RF_PALEVEL_PA2_ON,
 };
-use defmt::{debug, info, Format};
+use defmt::{debug, Format};
 use embedded_hal::{digital::InputPin, digital::OutputPin};
 use embedded_hal_async::{delay::DelayNs, digital::Wait};
 
+/// RFM69 radio driver instance.
+///
+/// Generic over SPI device, reset pin, interrupt pin, and delay provider.
 pub struct Rfm69<SPI, RESET, INTR, D> {
-    pub spi: SPI,
-    pub reset_pin: RESET,
-    pub intr_pin: INTR,
-    pub delay: D,
+    spi: SPI,
+    reset_pin: RESET,
+    intr_pin: INTR,
+    delay: D,
     tx_power: i8,
     is_high_power: bool,
     current_mode: Rfm69Mode,
 }
 
+/// Errors that can occur when interacting with the RFM69 module.
 #[derive(Debug, PartialEq, Format)]
 pub enum Rfm69Error {
+    /// Failed to reset the module.
     ResetError,
+    /// SPI write operation failed.
     SpiWriteError,
+    /// SPI read operation failed.
     SpiReadError,
+    /// Invalid configuration provided.
     ConfigurationError,
+    /// Message exceeds maximum size (60 bytes).
     MessageTooLarge,
+    /// Operation not valid in current mode.
     InvalidMode,
+    /// Waiting for interrupt failed.
+    WaitError,
 }
 
+/// Operating mode of the RFM69 module.
 #[derive(Clone, Debug, PartialEq, Format)]
 pub enum Rfm69Mode {
+    /// Sleep mode - lowest power consumption.
     Sleep = 0x00,
+    /// Standby mode - ready to transmit or receive.
     Standby = 0x04,
+    /// Frequency synthesizer mode.
     Fs = 0x08,
+    /// Transmit mode.
     Tx = 0x0C,
+    /// Receive mode.
     Rx = 0x10,
 }
 
+/// Configuration for initializing the RFM69 module.
+#[derive(Clone)]
 pub struct Rfm69Config {
+    /// Sync word configuration.
     pub sync_configuration: SyncConfiguration,
+    /// Sync words (up to 8 bytes).
     pub sync_words: [u8; 8],
+    /// Number of sync words to use (1-8).
+    pub sync_word_len: usize,
+    /// Modem configuration preset.
     pub modem_config: ModemConfigChoice,
+    /// Preamble length in bytes.
     pub preamble_length: u16,
+    /// Frequency in MHz.
     pub frequency: u32,
+    /// Transmit power in dBm.
     pub tx_power: i8,
+    /// Whether this is a high power module (RFM69HW).
     pub is_high_power: bool,
+}
+
+impl Default for Rfm69Config {
+    fn default() -> Self {
+        Self {
+            sync_configuration: SyncConfiguration::FifoFillAuto { sync_tolerance: 0 },
+            sync_words: [0x2D, 0xD4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            sync_word_len: 2,
+            modem_config: ModemConfigChoice::GfskRb250Fd250,
+            preamble_length: 4,
+            frequency: 915,
+            tx_power: 13,
+            is_high_power: true,
+        }
+    }
 }
 
 impl<SPI, RESET, INTR, D> Rfm69<SPI, RESET, INTR, D>
@@ -67,6 +132,15 @@ where
         Ok(())
     }
 
+    /// Creates a new RFM69 driver instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `spi` - SPI device for communication
+    /// * `reset_pin` - GPIO pin connected to the module's reset
+    /// * `intr_pin` - GPIO pin connected to DIO0 for interrupts
+    /// * `delay` - Delay provider for timing operations
+    #[must_use]
     pub fn new(spi: SPI, reset_pin: RESET, intr_pin: INTR, delay: D) -> Self {
         Rfm69 {
             spi,
@@ -79,11 +153,23 @@ where
         }
     }
 
+    /// Initializes the RFM69 module with default settings.
+    ///
+    /// This resets the module and configures it with sensible defaults:
+    /// - GFSK modulation at 250kbps
+    /// - 915 MHz frequency
+    /// - 13 dBm transmit power
+    /// - 2-byte sync word (0x2D, 0xD4)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if communication with the module fails or
+    /// if the module doesn't respond with the expected version.
     pub async fn init(&mut self) -> Result<(), Rfm69Error> {
         self.delay.delay_ms(10).await;
         self.reset().await?;
 
-        let version = self.read_register(Register::Version)?;
+        let version = self.read_register(Register::Version).await?;
 
         debug!("RFM69 version: {:?}", version);
 
@@ -94,36 +180,88 @@ where
 
         // self.spi.write_many(Register::OpMode, &[0x04]);
 
-        self.set_default_fifo_threshold()?;
-        self.set_dagc(ContinuousDagc::ImprovedLowBeta1)?;
+        self.set_default_fifo_threshold().await?;
+        self.set_dagc(ContinuousDagc::ImprovedLowBeta1).await?;
 
-        self.write_register(Register::Lna, 0x88)?;
+        self.write_register(Register::Lna, 0x88).await?;
         let sync_word = [0x2D, 0xD4];
         self.set_sync_words(
             SyncConfiguration::FifoFillAuto { sync_tolerance: 0 },
             &sync_word,
-        )?;
+        )
+        .await?;
 
         // If high power boost set previously, disable it
-        self.write_register(Register::TestPa1, 0x55)?;
-        self.write_register(Register::TestPa2, 0x70)?;
+        self.write_register(Register::TestPa1, 0x55).await?;
+        self.write_register(Register::TestPa2, 0x70).await?;
 
-        self.set_modem_config(ModemConfigChoice::GfskRb250Fd250)?;
+        self.set_modem_config(ModemConfigChoice::GfskRb250Fd250)
+            .await?;
 
-        self.set_preamble_length(4)?;
+        self.set_preamble_length(4).await?;
 
-        self.set_tx_power(13)?;
+        self.set_tx_power(13).await?;
 
-        self.set_frequency(915)?;
+        self.set_frequency(915).await?;
 
         self.set_mode(Rfm69Mode::Standby).await?;
 
         Ok(())
     }
 
-    pub fn read_all_registers(&mut self) -> Result<[(u8, u8); 84], Rfm69Error> {
+    /// Initializes the RFM69 module with the provided configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration settings for the module
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if communication with the module fails or
+    /// if the configuration is invalid.
+    pub async fn init_with_config(&mut self, config: Rfm69Config) -> Result<(), Rfm69Error> {
+        self.delay.delay_ms(10).await;
+        self.reset().await?;
+
+        let version = self.read_register(Register::Version).await?;
+
+        debug!("RFM69 version: {:?}", version);
+
+        if version != 0x24 {
+            return Err(Rfm69Error::SpiReadError);
+        }
+
+        self.is_high_power = config.is_high_power;
+
+        self.set_default_fifo_threshold().await?;
+        self.set_dagc(ContinuousDagc::ImprovedLowBeta1).await?;
+
+        self.write_register(Register::Lna, 0x88).await?;
+        self.set_sync_words(
+            config.sync_configuration,
+            &config.sync_words[..config.sync_word_len],
+        )
+        .await?;
+
+        self.write_register(Register::TestPa1, 0x55).await?;
+        self.write_register(Register::TestPa2, 0x70).await?;
+
+        self.set_modem_config(config.modem_config).await?;
+        self.set_preamble_length(config.preamble_length).await?;
+        self.set_tx_power(config.tx_power).await?;
+        self.set_frequency(config.frequency).await?;
+
+        self.set_mode(Rfm69Mode::Standby).await?;
+
+        Ok(())
+    }
+
+    /// Reads all registers from the RFM69 module.
+    ///
+    /// Returns an array of (register address, value) tuples for debugging purposes.
+    pub async fn read_all_registers(&mut self) -> Result<[(u8, u8); 84], Rfm69Error> {
         let mut registers = [0u8; 79];
-        self.read_many(Register::OpMode, &mut registers)?;
+        self.read_many(Register::OpMode, &mut registers).await?;
 
         let mut mapped: [(u8, u8); 84] = [(0, 0); 84]; // Initialize the mapped array
 
@@ -133,53 +271,60 @@ where
 
         mapped[79] = (
             Register::TestLna.addr(),
-            self.read_register(Register::TestLna)?,
+            self.read_register(Register::TestLna).await?,
         );
         mapped[80] = (
             Register::TestPa1.addr(),
-            self.read_register(Register::TestPa1)?,
+            self.read_register(Register::TestPa1).await?,
         );
         mapped[81] = (
             Register::TestPa2.addr(),
-            self.read_register(Register::TestPa2)?,
+            self.read_register(Register::TestPa2).await?,
         );
         mapped[82] = (
             Register::TestDagc.addr(),
-            self.read_register(Register::TestDagc)?,
+            self.read_register(Register::TestDagc).await?,
         );
         mapped[83] = (
             Register::TestAfc.addr(),
-            self.read_register(Register::TestAfc)?,
+            self.read_register(Register::TestAfc).await?,
         );
 
         Ok(mapped)
     }
 
-    pub fn read_revision(&mut self) -> Result<u8, Rfm69Error> {
-        self.read_register(Register::Version)
+    /// Reads the chip revision/version register.
+    ///
+    /// Should return 0x24 for RFM69 modules.
+    pub async fn read_revision(&mut self) -> Result<u8, Rfm69Error> {
+        self.read_register(Register::Version).await
     }
 
+    /// Reads the internal temperature sensor.
+    ///
+    /// Returns the temperature in degrees Celsius.
+    /// Note: This is approximate and intended for relative measurements.
     pub async fn read_temperature(&mut self) -> Result<f32, Rfm69Error> {
-        self.write_register(Register::Temp1, 0x08)?;
-        while self.read_register(Register::Temp1)? & 0x04 != 0x00 {
+        self.write_register(Register::Temp1, 0x08).await?;
+        while self.read_register(Register::Temp1).await? & 0x04 != 0x00 {
             self.delay.delay_ms(10).await;
         }
 
-        let temp = self.read_register(Register::Temp2)?;
+        let temp = self.read_register(Register::Temp2).await?;
         Ok((166 as f32) - temp as f32)
     }
 
-    fn set_default_fifo_threshold(&mut self) -> Result<(), Rfm69Error> {
-        self.write_register(Register::FifoThresh, 0x8F)?;
+    async fn set_default_fifo_threshold(&mut self) -> Result<(), Rfm69Error> {
+        self.write_register(Register::FifoThresh, 0x8F).await?;
         Ok(())
     }
 
-    fn set_dagc(&mut self, value: ContinuousDagc) -> Result<(), Rfm69Error> {
-        self.write_register(Register::TestDagc, value as u8)?;
+    async fn set_dagc(&mut self, value: ContinuousDagc) -> Result<(), Rfm69Error> {
+        self.write_register(Register::TestDagc, value as u8).await?;
         Ok(())
     }
 
-    fn set_sync_words(
+    async fn set_sync_words(
         &mut self,
         config: SyncConfiguration,
         sync_words: &[u8],
@@ -196,22 +341,23 @@ where
         // Add the sync words to the buffer
         buffer[1..1 + sync_words.len()].copy_from_slice(sync_words);
         // Write the config value first, then the sync words.
-        self.write_many(Register::SyncConfig, &buffer)?;
+        self.write_many(Register::SyncConfig, &buffer).await?;
 
         Ok(())
     }
 
-    fn set_modem_config(&mut self, config: ModemConfigChoice) -> Result<(), Rfm69Error> {
+    async fn set_modem_config(&mut self, config: ModemConfigChoice) -> Result<(), Rfm69Error> {
         let values = config.values();
 
-        self.write_many(Register::DataModul, &values[0..5])?;
-        self.write_many(Register::RxBw, &values[5..7])?;
-        self.write_register(Register::PacketConfig1, values[7])?;
+        self.write_many(Register::DataModul, &values[0..5]).await?;
+        self.write_many(Register::RxBw, &values[5..7]).await?;
+        self.write_register(Register::PacketConfig1, values[7])
+            .await?;
 
         Ok(())
     }
 
-    fn set_preamble_length(&mut self, preamble_length: u16) -> Result<(), Rfm69Error> {
+    async fn set_preamble_length(&mut self, preamble_length: u16) -> Result<(), Rfm69Error> {
         // split the preamble length into two bytes
         let msb = (preamble_length >> 8) as u8;
         let lsb = preamble_length as u8;
@@ -219,11 +365,16 @@ where
         // write the two bytes to the RFM69
         let buffer = [msb, lsb];
 
-        self.write_many(Register::PreambleMsb, &buffer)?;
+        self.write_many(Register::PreambleMsb, &buffer).await?;
         Ok(())
     }
 
-    pub fn set_frequency(&mut self, freq_mhz: u32) -> Result<(), Rfm69Error> {
+    /// Sets the carrier frequency.
+    ///
+    /// # Arguments
+    ///
+    /// * `freq_mhz` - Frequency in MHz (e.g., 433, 868, 915)
+    pub async fn set_frequency(&mut self, freq_mhz: u32) -> Result<(), Rfm69Error> {
         let mut frf = (freq_mhz * RF69_FSTEP) as u32;
         frf /= RF69_FXOSC as u32;
 
@@ -233,11 +384,20 @@ where
         let lsb = (frf & 0xFF) as u8;
 
         let buffer = [msb, mid, lsb];
-        self.write_many(Register::FrfMsb, &buffer)?;
+        self.write_many(Register::FrfMsb, &buffer).await?;
         Ok(())
     }
 
-    pub fn set_tx_power(&mut self, tx_power: i8) -> Result<(), Rfm69Error> {
+    /// Sets the transmit power level.
+    ///
+    /// # Arguments
+    ///
+    /// * `tx_power` - Power level in dBm
+    ///   - For high power modules (RFM69HW): -2 to +20 dBm
+    ///   - For standard modules: -18 to +13 dBm
+    ///
+    /// Values outside these ranges will be clamped.
+    pub async fn set_tx_power(&mut self, tx_power: i8) -> Result<(), Rfm69Error> {
         let pa_level;
 
         if self.is_high_power {
@@ -268,11 +428,20 @@ where
                 RF_PALEVEL_PA0_ON | ((clamped_power + 18) as u8 & RF_PALEVEL_OUTPUTPOWER_11111);
         }
 
-        self.write_register(Register::PaLevel, pa_level)?;
+        self.write_register(Register::PaLevel, pa_level).await?;
         self.tx_power = tx_power;
         Ok(())
     }
 
+    /// Sets the operating mode of the RFM69 module.
+    ///
+    /// # Arguments
+    ///
+    /// * `mode` - The desired operating mode
+    ///
+    /// This method configures the DIO0 interrupt mapping appropriately:
+    /// - In TX mode: DIO0 signals PacketSent
+    /// - In RX mode: DIO0 signals PayloadReady
     pub async fn set_mode(&mut self, mode: Rfm69Mode) -> Result<(), Rfm69Error> {
         if self.current_mode == mode {
             return Ok(());
@@ -282,33 +451,38 @@ where
             Rfm69Mode::Rx => {
                 // If high power boost, return power amp to receive mode
                 if self.tx_power >= 18 {
-                    self.write_register(Register::TestPa1, 0x55)?;
-                    self.write_register(Register::TestPa2, 0x70)?;
+                    self.write_register(Register::TestPa1, 0x55).await?;
+                    self.write_register(Register::TestPa2, 0x70).await?;
                 }
+
+                // Configure DIO0 for PayloadReady interrupt in RX mode
+                self.write_register(Register::DioMapping1, RF_DIOMAPPING1_DIO0_00)
+                    .await?;
             }
 
             Rfm69Mode::Tx => {
                 // If high power boost, enable power amp
                 if self.tx_power >= 18 {
-                    self.write_register(Register::TestPa1, 0x5D)?;
-                    self.write_register(Register::TestPa2, 0x7C)?;
+                    self.write_register(Register::TestPa1, 0x5D).await?;
+                    self.write_register(Register::TestPa2, 0x7C).await?;
                 }
 
-                // enable the packet sent interrupt
-                self.write_register(Register::DioMapping1, RF_DIOMAPPING1_DIO0_00)?;
+                // Configure DIO0 for PacketSent interrupt in TX mode
+                self.write_register(Register::DioMapping1, RF_DIOMAPPING1_DIO0_00)
+                    .await?;
             }
 
             _ => {}
         }
 
         // Read the current mode
-        let mut current_mode = self.read_register(Register::OpMode)?;
+        let mut current_mode = self.read_register(Register::OpMode).await?;
         current_mode &= !0x1C;
         current_mode |= mode.clone() as u8 & 0x1C;
 
         // // Set the new mode
-        self.write_register(Register::OpMode, current_mode)?;
-        while (self.read_register(Register::IrqFlags1)? & 0x80) == 0x00 {
+        self.write_register(Register::OpMode, current_mode).await?;
+        while (self.read_register(Register::IrqFlags1).await? & 0x80) == 0x00 {
             self.delay.delay_ms(10).await;
         }
 
@@ -317,14 +491,26 @@ where
     }
 
     async fn wait_packet_sent(&mut self) -> Result<(), Rfm69Error> {
-        self.intr_pin.wait_for_high().await.unwrap();
-        while (self.read_register(Register::IrqFlags2)? & 0x08) == 0 {
-            info!("Waiting for packet sent...");
-            self.delay.delay_ms(10).await;
-        }
+        // DIO0 is configured for PacketSent in TX mode, wait for IRQ
+        self.intr_pin
+            .wait_for_high()
+            .await
+            .map_err(|_| Rfm69Error::WaitError)?;
         Ok(())
     }
 
+    /// Sends a data packet.
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - Data to send (maximum 60 bytes)
+    ///
+    /// # Errors
+    ///
+    /// Returns `Rfm69Error::MessageTooLarge` if data exceeds 60 bytes.
+    ///
+    /// This method automatically switches to TX mode, waits for transmission
+    /// to complete, then returns to Standby mode.
     pub async fn send(&mut self, data: &[u8]) -> Result<(), Rfm69Error> {
         const HEADER_LENGTH: usize = 5;
 
@@ -338,7 +524,8 @@ where
         buffer[1..5].copy_from_slice(&header);
         buffer[5..5 + data.len()].copy_from_slice(data);
 
-        self.write_many(Register::Fifo, &buffer[0..data.len() + HEADER_LENGTH])?;
+        self.write_many(Register::Fifo, &buffer[0..data.len() + HEADER_LENGTH])
+            .await?;
 
         self.set_mode(Rfm69Mode::Tx).await?;
         self.wait_packet_sent().await?;
@@ -347,62 +534,164 @@ where
         Ok(())
     }
 
-    pub fn is_message_available(&mut self) -> Result<bool, Rfm69Error> {
+    /// Checks if a message is available in the FIFO.
+    ///
+    /// Must be in RX mode to call this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Rfm69Error::InvalidMode` if not in RX mode.
+    pub async fn is_message_available(&mut self) -> Result<bool, Rfm69Error> {
         if self.current_mode != Rfm69Mode::Rx {
             return Err(Rfm69Error::InvalidMode);
         }
-        Ok((self.read_register(Register::IrqFlags2)? & 0x04) == 0x04)
+        Ok((self.read_register(Register::IrqFlags2).await? & 0x04) == 0x04)
     }
 
+    /// Waits for a message to be received.
+    ///
+    /// This method blocks until a message is available, using the DIO0
+    /// interrupt to efficiently wait without polling.
+    ///
+    /// Must be in RX mode before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Rfm69Error::InvalidMode` if not in RX mode.
+    /// Returns `Rfm69Error::WaitError` if the interrupt wait fails.
     pub async fn wait_for_message(&mut self) -> Result<(), Rfm69Error> {
-        while !self.is_message_available()? {
-            self.delay.delay_ms(1000).await;
+        if self.current_mode != Rfm69Mode::Rx {
+            return Err(Rfm69Error::InvalidMode);
         }
+
+        // DIO0 is configured for PayloadReady in RX mode, wait for IRQ
+        self.intr_pin
+            .wait_for_high()
+            .await
+            .map_err(|_| Rfm69Error::WaitError)?;
         Ok(())
     }
 
+    /// Waits for a message with a timeout.
+    ///
+    /// Similar to `wait_for_message()`, but returns after the specified
+    /// timeout if no message is received.
+    ///
+    /// # Arguments
+    ///
+    /// * `timeout_ms` - Maximum time to wait in milliseconds
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(true)` if a message was received, `Ok(false)` if the
+    /// timeout expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Rfm69Error::InvalidMode` if not in RX mode.
+    pub async fn wait_for_message_with_timeout(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<bool, Rfm69Error> {
+        if self.current_mode != Rfm69Mode::Rx {
+            return Err(Rfm69Error::InvalidMode);
+        }
+
+        // Poll with delays up to timeout
+        let mut elapsed: u32 = 0;
+        const POLL_INTERVAL_MS: u32 = 10;
+
+        while elapsed < timeout_ms {
+            if self.is_message_available().await? {
+                return Ok(true);
+            }
+            self.delay.delay_ms(POLL_INTERVAL_MS).await;
+            elapsed += POLL_INTERVAL_MS;
+        }
+
+        Ok(false)
+    }
+
+    /// Receives a message from the FIFO.
+    ///
+    /// Call `wait_for_message()` or check `is_message_available()` before
+    /// calling this method to ensure a message is ready.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffer` - Buffer to store the received message
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of bytes received (excluding the 4-byte header).
     pub async fn receive(&mut self, buffer: &mut [u8; 65]) -> Result<usize, Rfm69Error> {
-        let message_len = self.read_register(Register::Fifo)?;
+        let message_len = self.read_register(Register::Fifo).await?;
         if buffer.len() < message_len as usize {
             return Err(Rfm69Error::MessageTooLarge);
         }
 
         let mut header = [0u8; 4];
-        self.read_many(Register::Fifo, &mut header).unwrap();
+        self.read_many(Register::Fifo, &mut header).await?;
 
         self.read_many(Register::Fifo, &mut buffer[0..(message_len - 4) as usize])
-            .unwrap();
+            .await?;
         Ok((message_len - 4) as usize)
     }
 
-    pub fn rssi(&mut self) -> Result<u8, Rfm69Error> {
-        let rssi = self.read_register(Register::RssiValue)?;
+    /// Reads the current RSSI (Received Signal Strength Indicator).
+    ///
+    /// # Returns
+    ///
+    /// Returns the RSSI value in -dBm (e.g., 40 means -40 dBm).
+    pub async fn rssi(&mut self) -> Result<u8, Rfm69Error> {
+        let rssi = self.read_register(Register::RssiValue).await?;
         Ok(rssi / 2)
     }
 
-    fn write_register(&mut self, register: Register, value: u8) -> Result<(), Rfm69Error> {
-        self.write_many(register, &[value])?;
+    /// Returns the current operating mode.
+    #[must_use]
+    pub fn current_mode(&self) -> &Rfm69Mode {
+        &self.current_mode
+    }
+
+    /// Returns the current transmit power setting in dBm.
+    #[must_use]
+    pub fn tx_power(&self) -> i8 {
+        self.tx_power
+    }
+
+    /// Returns whether this is configured as a high power module.
+    #[must_use]
+    pub fn is_high_power(&self) -> bool {
+        self.is_high_power
+    }
+
+    async fn write_register(&mut self, register: Register, value: u8) -> Result<(), Rfm69Error> {
+        self.write_many(register, &[value]).await?;
         Ok(())
     }
 
-    fn read_register(&mut self, register: Register) -> Result<u8, Rfm69Error> {
+    async fn read_register(&mut self, register: Register) -> Result<u8, Rfm69Error> {
         let mut buffer = [0u8; 1];
         self.spi
             .read_many(register, &mut buffer)
+            .await
             .map_err(|_| Rfm69Error::SpiWriteError)?;
         Ok(buffer[0])
     }
 
-    fn write_many(&mut self, register: Register, values: &[u8]) -> Result<(), Rfm69Error> {
+    async fn write_many(&mut self, register: Register, values: &[u8]) -> Result<(), Rfm69Error> {
         self.spi
             .write_many(register, values)
+            .await
             .map_err(|_| Rfm69Error::SpiWriteError)?;
         Ok(())
     }
 
-    fn read_many(&mut self, register: Register, buffer: &mut [u8]) -> Result<(), Rfm69Error> {
+    async fn read_many(&mut self, register: Register, buffer: &mut [u8]) -> Result<(), Rfm69Error> {
         self.spi
             .read_many(register, buffer)
+            .await
             .map_err(|_| Rfm69Error::SpiReadError)?;
         Ok(())
     }
@@ -498,8 +787,8 @@ mod tests {
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_default_fifo_threshold() {
+    #[tokio::test]
+    async fn test_set_default_fifo_threshold() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -511,13 +800,13 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_default_fifo_threshold().unwrap();
+        rfm.set_default_fifo_threshold().await.unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_dagc() {
+    #[tokio::test]
+    async fn test_set_dagc() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -529,7 +818,9 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_dagc(ContinuousDagc::ImprovedLowBeta1).unwrap();
+        rfm.set_dagc(ContinuousDagc::ImprovedLowBeta1)
+            .await
+            .unwrap();
 
         check_expectations(&mut rfm);
     }
@@ -545,8 +836,8 @@ mod tests {
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_sync_words() {
+    #[tokio::test]
+    async fn test_set_sync_words() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -563,13 +854,14 @@ mod tests {
             SyncConfiguration::FifoFillAuto { sync_tolerance: 0 },
             &sync_words,
         )
+        .await
         .unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_sync_words_clamp() {
+    #[tokio::test]
+    async fn test_set_sync_words_clamp() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -588,13 +880,14 @@ mod tests {
             SyncConfiguration::FifoFillAuto { sync_tolerance: 14 },
             &sync_words,
         )
+        .await
         .unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_sync_words_too_long() {
+    #[tokio::test]
+    async fn test_set_sync_words_too_long() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [];
@@ -606,15 +899,16 @@ mod tests {
             rfm.set_sync_words(
                 SyncConfiguration::FifoFillAuto { sync_tolerance: 0 },
                 &sync_words
-            ),
+            )
+            .await,
             Err(Rfm69Error::ConfigurationError)
         );
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_sync_words_empty() {
+    #[tokio::test]
+    async fn test_set_sync_words_empty() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [];
@@ -626,15 +920,16 @@ mod tests {
             rfm.set_sync_words(
                 SyncConfiguration::FifoFillAuto { sync_tolerance: 0 },
                 &sync_words
-            ),
+            )
+            .await,
             Err(Rfm69Error::ConfigurationError)
         );
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_modem_config() {
+    #[tokio::test]
+    async fn test_set_modem_config() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -654,13 +949,15 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_modem_config(ModemConfigChoice::FskRb2Fd5).unwrap();
+        rfm.set_modem_config(ModemConfigChoice::FskRb2Fd5)
+            .await
+            .unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_preamble_length() {
+    #[tokio::test]
+    async fn test_set_preamble_length() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -672,13 +969,13 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_preamble_length(255).unwrap();
+        rfm.set_preamble_length(255).await.unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_get_revision() {
+    #[tokio::test]
+    async fn test_get_revision() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -690,14 +987,14 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        let revision = rfm.read_revision().unwrap();
+        let revision = rfm.read_revision().await.unwrap();
         assert_eq!(revision, 0x24);
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_frequency() {
+    #[tokio::test]
+    async fn test_set_frequency() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -709,13 +1006,13 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_frequency(915).unwrap();
+        rfm.set_frequency(915).await.unwrap();
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_set_tx_power() {
+    #[tokio::test]
+    async fn test_set_tx_power() {
         let mut rfm = setup_rfm();
 
         let spi_expectations = [
@@ -727,7 +1024,7 @@ mod tests {
 
         rfm.spi.update_expectations(&spi_expectations);
 
-        rfm.set_tx_power(-2).unwrap();
+        rfm.set_tx_power(-2).await.unwrap();
         assert_eq!(rfm.tx_power, -2);
 
         check_expectations(&mut rfm);
@@ -747,6 +1044,11 @@ mod tests {
             SpiTransaction::transaction_start(),
             SpiTransaction::write(Register::TestPa2.write()),
             SpiTransaction::write(0x70),
+            SpiTransaction::transaction_end(),
+            // Configure DIO0 for PayloadReady interrupt in RX mode
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write(Register::DioMapping1.write()),
+            SpiTransaction::write(RF_DIOMAPPING1_DIO0_00),
             SpiTransaction::transaction_end(),
             // Read the current value of OpMode
             SpiTransaction::transaction_start(),
@@ -793,6 +1095,11 @@ mod tests {
             SpiTransaction::transaction_start(),
             SpiTransaction::write(Register::TestPa2.write()),
             SpiTransaction::write(0x7C),
+            SpiTransaction::transaction_end(),
+            // Configure DIO0 for PacketSent interrupt in TX mode
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write(Register::DioMapping1.write()),
+            SpiTransaction::write(RF_DIOMAPPING1_DIO0_00),
             SpiTransaction::transaction_end(),
             // // Read the current value of OpMode
             SpiTransaction::transaction_start(),
@@ -850,6 +1157,11 @@ mod tests {
             SpiTransaction::write(Register::Fifo.write()),
             SpiTransaction::write_vec(header),
             SpiTransaction::transaction_end(),
+            // Configure DIO0 for PacketSent interrupt in TX mode
+            SpiTransaction::transaction_start(),
+            SpiTransaction::write(Register::DioMapping1.write()),
+            SpiTransaction::write(RF_DIOMAPPING1_DIO0_00),
+            SpiTransaction::transaction_end(),
             // // Read the current value of OpMode
             SpiTransaction::transaction_start(),
             SpiTransaction::write(Register::OpMode.read()),
@@ -869,10 +1181,7 @@ mod tests {
             SpiTransaction::write(Register::IrqFlags1.read()),
             SpiTransaction::transfer_in_place(vec![0x00], vec![0x80]),
             SpiTransaction::transaction_end(),
-            SpiTransaction::transaction_start(),
-            SpiTransaction::write(Register::IrqFlags2.read()),
-            SpiTransaction::transfer_in_place(vec![0x00], vec![0x08]),
-            SpiTransaction::transaction_end(),
+            // wait_packet_sent now uses IRQ (intr_pin.wait_for_high()) - no SPI expectations
             // // // Read the current value of OpMode
             SpiTransaction::transaction_start(),
             SpiTransaction::write(Register::OpMode.read()),
@@ -892,8 +1201,11 @@ mod tests {
 
         let delay_expectations = [DelayTransaction::delay_ms(10)];
 
+        let intr_expectations = [GpioTransaction::wait_for_state(State::High)];
+
         rfm.spi.update_expectations(&spi_expectations);
         rfm.delay.update_expectations(&delay_expectations);
+        rfm.intr_pin.update_expectations(&intr_expectations);
 
         let message = "Hello, world!".as_bytes();
 
@@ -950,7 +1262,7 @@ mod tests {
         ];
         rfm.spi.update_expectations(&spi_expectations);
 
-        assert_eq!(rfm.is_message_available().unwrap(), true);
+        assert_eq!(rfm.is_message_available().await.unwrap(), true);
 
         let spi_expectations = [
             SpiTransaction::transaction_start(),
@@ -960,16 +1272,19 @@ mod tests {
         ];
         rfm.spi.update_expectations(&spi_expectations);
 
-        assert_eq!(rfm.is_message_available().unwrap(), false);
+        assert_eq!(rfm.is_message_available().await.unwrap(), false);
 
         rfm.current_mode = Rfm69Mode::Tx;
-        assert_eq!(rfm.is_message_available(), Err(Rfm69Error::InvalidMode));
+        assert_eq!(
+            rfm.is_message_available().await,
+            Err(Rfm69Error::InvalidMode)
+        );
 
         check_expectations(&mut rfm);
     }
 
-    #[test]
-    fn test_rssi() {
+    #[tokio::test]
+    async fn test_rssi() {
         let mut rfm = setup_rfm();
         rfm.current_mode = Rfm69Mode::Rx;
 
@@ -981,7 +1296,7 @@ mod tests {
         ];
         rfm.spi.update_expectations(&spi_expectations);
 
-        assert_eq!(rfm.rssi().unwrap(), 40);
+        assert_eq!(rfm.rssi().await.unwrap(), 40);
 
         check_expectations(&mut rfm);
     }
