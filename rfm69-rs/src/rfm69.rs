@@ -2,7 +2,7 @@ use crate::read_write::AsyncReadWrite;
 use crate::registers::Register;
 use crate::settings::{
     ContinuousDagc, ModemConfigChoice, SyncConfiguration, RF69_FSTEP, RF69_FXOSC,
-    RF_DIOMAPPING1_DIO0_00, RF_PALEVEL_OUTPUTPOWER_11111,
+    RF_DIOMAPPING1_DIO0_00, RF_DIOMAPPING1_DIO0_01, RF_PALEVEL_OUTPUTPOWER_11111,
     RF_PALEVEL_PA0_ON, RF_PALEVEL_PA1_ON, RF_PALEVEL_PA2_ON,
 };
 use defmt::{debug, info, Format};
@@ -204,6 +204,11 @@ where
                     self.write_register(Register::TestPa1, 0x55).await?;
                     self.write_register(Register::TestPa2, 0x70).await?;
                 }
+                // Restore DIO0 = PayloadReady. set_mode(Tx) writes DIO0_00
+                // (PacketSent); without this, re-entering Rx leaves DIO0
+                // permanently mapped wrong and the chip never raises an IRQ
+                // on a new packet.
+                self.write_register(Register::DioMapping1, RF_DIOMAPPING1_DIO0_01).await?;
             }
             Rfm69Mode::Tx => {
                 if self.tx_power >= 18 {
@@ -281,15 +286,35 @@ where
 
     pub async fn receive(&mut self, buffer: &mut [u8; 65]) -> Result<usize, Rfm69Error> {
         let message_len = self.read_register(Register::Fifo).await?;
-        if buffer.len() < message_len as usize {
+        // Bounds: header is 4 bytes, max payload is buffer.len() (65 - 4 = 61).
+        // Without this guard a corrupt length byte underflows (message_len - 4)
+        // and overruns the SPI burst, leaving FIFO in a permanently bad state.
+        if message_len < 4 || message_len as usize > buffer.len() + 4 {
+            self.restart_rx().await?;
             return Err(Rfm69Error::MessageTooLarge);
         }
 
         let mut header = [0u8; 4];
         self.read_many(Register::Fifo, &mut header).await?;
 
-        self.read_many(Register::Fifo, &mut buffer[0..(message_len - 4) as usize]).await?;
-        Ok((message_len - 4) as usize)
+        let payload_len = (message_len - 4) as usize;
+        self.read_many(Register::Fifo, &mut buffer[0..payload_len]).await?;
+
+        // If a FIFO overrun is latched (bit 4 of IrqFlags2), the chip will stop
+        // raising PayloadReady on subsequent packets until we pulse RestartRx.
+        let irq2 = self.read_register(Register::IrqFlags2).await?;
+        if irq2 & 0x10 != 0 {
+            self.restart_rx().await?;
+        }
+
+        Ok(payload_len)
+    }
+
+    /// Pulse PacketConfig2.RestartRx (bit 2) to flush a stuck FIFO and restart
+    /// receiver. The bit auto-clears in the chip per the datasheet.
+    async fn restart_rx(&mut self) -> Result<(), Rfm69Error> {
+        let pc2 = self.read_register(Register::PacketConfig2).await?;
+        self.write_register(Register::PacketConfig2, pc2 | 0x04).await
     }
 
     pub async fn rssi(&mut self) -> Result<u8, Rfm69Error> {
@@ -301,7 +326,7 @@ where
         self.write_many(register, &[value]).await
     }
 
-    async fn read_register(&mut self, register: Register) -> Result<u8, Rfm69Error> {
+    pub async fn read_register(&mut self, register: Register) -> Result<u8, Rfm69Error> {
         let mut buffer = [0u8; 1];
         self.spi
             .read_many_async(register, &mut buffer).await
