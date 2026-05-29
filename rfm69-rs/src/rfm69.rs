@@ -278,8 +278,18 @@ where
     }
 
     pub async fn wait_for_message(&mut self) -> Result<(), Rfm69Error> {
-        while !self.is_message_available().await? {
-            self.delay.delay_ms(1).await;
+        // DIO0 in Rx mode is mapped to PayloadReady (set_mode(Rx) writes
+        // DIO0_01). Wait on the interrupt line instead of busy-polling SPI
+        // every 1 ms — lower latency, less SPI traffic, better async manners.
+        // wait_for_high is level-triggered, so it returns immediately if a
+        // packet was already pending when we entered the call.
+        self.intr_pin.wait_for_high().await.unwrap();
+        // Confirm via register in case the line glitches or DIO0 wasn't
+        // remapped yet (e.g., first iteration before set_mode(Rx) ran).
+        if !self.is_message_available().await? {
+            while !self.is_message_available().await? {
+                self.delay.delay_ms(1).await;
+            }
         }
         Ok(())
     }
